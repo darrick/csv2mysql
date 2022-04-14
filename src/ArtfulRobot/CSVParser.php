@@ -11,6 +11,8 @@
 
 namespace App\ArtfulRobot;
 
+use League\Csv\Reader;
+
 /**
  * Parse a CSV file.
  *
@@ -110,7 +112,7 @@ class CSVParser implements \Iterator {
 	public function loadFromFile(string $filename, ?int $max_buffer_length = 0, ?int $headerRow = 1) {
 
 		// Parse CSV file
-		$csv_file = fopen($filename, "r");
+		$csv = Reader::createFromPath($filename, 'r');
 
 		// Load data
 		$this->data = [];

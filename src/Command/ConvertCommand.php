@@ -10,13 +10,14 @@
  */
 namespace App\Command;
 
-use App\ArtfulRobot\CSVParser;
+use League\Csv\Reader;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Helper\ProgressBar;
+
 
 class ConvertCommand extends Command
 {
@@ -46,27 +47,33 @@ class ConvertCommand extends Command
 			return 1;
 		}
 		try {
-			$parser = CSVParser::createFromFile($csvFilename, $input->getOption('csv-read-buffer') * 1024);
+			$reader = Reader::createFromPath($csvFilename, 'r');
+			$reader->setDelimiter('|');
+			$reader->setHeaderOffset(0);
 		}
 		catch (\Exception $e) {
 			$output->writeln("<error>-- Error: input '$csvFilename': " . $e->getMessage() . "</error>");
 			return 1;
 		}
-		if ($parser->count() == 0) {
+		if (count($reader) == 0) {
 			$output->writeln("<comment>-- Ignored file with no row data: $csvFilename</comment>");
 			return 1;
 		}
 
-		$isBigFile = ($parser->count() > 100);
+		$isBigFile = (count($reader) > 100);
 		ProgressBar::setFormatDefinition('custom', '  <info>%message%</info> %percent%% %bar% Est %remaining%');
 
-		$tableName = preg_replace( '/[^a-zA-Z0-9_]+/', '_',
-				preg_replace('@^(?:.*/)?([^/]+)\.csv$@', '$1', $csvFilename));
+        $path_parts = pathinfo($csvFilename);
+		$tableName = preg_replace( '/[^a-zA-Z0-9_]+/', '_', $path_parts['filename']);
 
 		// Determine column types.
 		$schemaCols = $cols = [];
+
+		$indexCols = [];
 		$foundID = FALSE;
-		foreach ($parser->getHeaders() as $colname) {
+		foreach ($reader->getHeader() as $colname) {
+			if ($colname == '^') continue;
+			if (empty($colname)) continue;
 			$cols[$colname] = [
 				'name' => trim(preg_replace('/[^a-zA-Z0-9]+/', '_', $colname)),
 				// A column type is true until a non-valid value is encountered.
@@ -85,6 +92,9 @@ class ConvertCommand extends Command
 
 				'uniqueVals' => [],
 			];
+			if (preg_match("/_id$/", $cols[$colname]['name'])) {
+				$indexCols[] = $cols[$colname]['name'];
+			}
 		}
 
 		// 2x because we scan and then we generate the INSERTS
@@ -95,11 +105,13 @@ class ConvertCommand extends Command
 			$progressBar->start();
 		}
 
+		$records = $reader->getRecords();
+
 		foreach (array_keys($cols) as $colname) {
 			$t = &$cols[$colname];
 
-			foreach ($parser as $row) {
-				$val = $row->$colname;
+			foreach ($records as $offset => $row) {
+				$val = $row[$colname];
 				$t['uniqueVals'][$val] = 1;
 				if ($val === '') {
 					// There empty values. (Note here, empty means zero-length string.)
@@ -140,7 +152,7 @@ class ConvertCommand extends Command
 				$type = $t['unique'][0];
 			}
 			elseif ($c > 1) {
-				throw new \RuntimeException("Row " . $parser->key() . " col '" . $colname . "' could be "
+				throw new \RuntimeException("Row " . $offset . " col '" . $colname . "' could be "
 						. implode(' or ', $t['unique']). " FRom values:\n" . json_encode($t, JSON_PRETTY_PRINT));
 			}
 
@@ -211,7 +223,7 @@ class ConvertCommand extends Command
 								}
 							}
 			else {
-				throw new \RuntimeException("Row " . $parser->key() . " col '" . $colname . "' unexpected type '$type'");
+				throw new \RuntimeException("Row " . $offset . " col '" . $colname . "' unexpected type '$type'");
 			}
 			$cols[$colname]['type'] = $type;
 
@@ -225,7 +237,7 @@ class ConvertCommand extends Command
 			}
 		}
 
-		$schemaSQL = '';
+		$schemaSQL = "\n\n";
 		if ($input->getOption('drop')) {
 			$schemaSQL = "DROP TABLE IF EXISTS `$tableName`;\n";
 		}
@@ -233,8 +245,8 @@ class ConvertCommand extends Command
 		// Add an ID if there is none.
 		$prefix = '';
 		if (!$foundID) {
-			$schemaSQL .= "  id INT(10) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY";
-			$prefix = ",\n  ";
+			//$schemaSQL .= "  id INT(10) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY";
+			//$prefix = ",\n  ";
 		}
 
 		foreach ($schemaCols as $colName => $def) {
@@ -242,8 +254,20 @@ class ConvertCommand extends Command
 			$prefix = ",\n  ";
 		}
 		$schemaSQL .= "\n);\n";
+		
+		$indexSQL = "ALTER TABLE '$tableName'\n";
+
+    $index_lines[] = array();
+
+		foreach ($indexCols as $colName) {
+			$index_line[] = "\tADD KEY '$colName' ('$colName')";
+		}
+
+    $indexSQL .= implode(",\n", $index_line) . ";\n";
+
 
 		$output->writeln("<info>$schemaSQL</info>");
+		$output->writeln("<info>$indexSQL</info>");
 
 		if (isset($progressBar)) {
 			$progressBar->finish();
@@ -265,12 +289,12 @@ class ConvertCommand extends Command
 		$command = $insert;
 		$sep = '';
 		if (isset($progressBar)) {
-			$progressBar = new ProgressBar($output, $parser->count());
+			$progressBar = new ProgressBar($output, count($reader));
 			$progressBar->setFormat('custom');
 			$progressBar->setMessage("Writing INSERTS");
 			$progressBar->start();
 		}
-		foreach ($parser as $row) {
+		foreach ($records as $row) {
 			$data = [];
 			foreach ($cols as $header=>$col) {
 				$val = $row->$header;
