@@ -11,32 +11,67 @@
 namespace App\Command;
 
 use League\Csv\Reader;
+use League\Csv\Stream;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Helper\ProgressBar;
+use Symfony\Component\Filesystem\Filesystem;
 
 
 class ConvertCommand extends Command
 {
+    public static $maxint = 0;
+
+    protected $outputFile;
+    protected $filesystem;
     protected function configure() {
         $this->setName('convert')
             ->setDescription('Convert CSV file to MySQL SQL')
             ->setHelp('')
-            ->addOption('input', 'i', InputOption::VALUE_REQUIRED, 'input CSV filename')
             // ->addOption('output', 'o', InputOption::VALUE_REQUIRED, 'output SQL filename')
             ->addOption('drop', 'd', InputOption::VALUE_NONE, 'Include DROP TABLE? (default no, and use CREATE TABLE IF NOT EXISTS)')
             ->addOption('schema', 's', InputOption::VALUE_NONE, 'Just the schema, no INSERTs')
+            ->addOption('import-extension', 'e', InputOption::VALUE_REQUIRED, 'Extension of files to import (i.e. csv or dat)','dat')
             ->addOption('csv-read-buffer', 'b', InputOption::VALUE_REQUIRED, 'Buffer size in kB. Each line of CSV must be shorter than this. Default 10', 10)
             ->addOption('max-command-length', 'm', InputOption::VALUE_REQUIRED, 'Max length of INSERT SQL command in kB. Default 10.', 10)
+            ->addArgument('inputfiles', InputArgument::IS_ARRAY | InputArgument::REQUIRED, "CSV files or Directory of files to convert")
             ;
     }
 
     protected function execute(InputInterface $input, OutputInterface $output) {
 
-        $csvFilename = $input->getOption('input');
+        $inputfiles = $input->getArgument('inputfiles');
+
+        $extension = $input->getOption('import-extension');
+
+        $files = array();
+        $this->filesystem = new Filesystem();
+        $this->outputFile = "output.sql";
+        //$this->filesystem->remove($this->outputFile);
+
+        foreach ($inputfiles as $inputfile) {
+            // Open a known directory, and proceed to read its contents
+            if (is_dir($inputfile)) {
+                $dirfiles = glob($inputfile . "/*." . $extension);
+                if ($dirfiles) {
+                    $files += $dirfiles;
+                }
+            } else {
+                $files[] = $inputfile;
+            }
+        }
+
+        foreach ($files as $file) {
+            $this->executeOne($input, $output, $file);
+        }
+        return 0;
+    }
+
+    protected function executeOne(InputInterface $input, OutputInterface $output, $csvFilename) {
+
 
         if (!file_exists($csvFilename)) {
             $output->writeln("<error>Error: input '$csvFilename' not found</error>");
@@ -49,111 +84,115 @@ class ConvertCommand extends Command
         try {
             $reader = Reader::createFromPath($csvFilename, 'r');
             $reader->setDelimiter('|');
-            $reader->setHeaderOffset(0);
         }
         catch (\Exception $e) {
             $output->writeln("<error>-- Error: input '$csvFilename': " . $e->getMessage() . "</error>");
             return 1;
         }
-        if (count($reader) == 0) {
-            $output->writeln("<comment>-- Ignored file with no row data: $csvFilename</comment>");
-            return 1;
-        }
 
-        $isBigFile = (count($reader) > 100);
-        ProgressBar::setFormatDefinition('custom', '  <info>%message%</info> %percent%% %bar% Est %remaining%');
+        //$isBigFile = ($reader->count() > 100);
+
 
         $path_parts = pathinfo($csvFilename);
+
         $tableName = preg_replace( '/[^a-zA-Z0-9_]+/', '_', $path_parts['filename']);
 
         // Determine column types.
-        $schemaCols = $cols = [];
+        $schemaCols = $indexCols = $columns = $column_keys = [];
 
-        $indexCols = [];
         $foundID = FALSE;
-        foreach ($reader->getHeader() as $colname) {
-            if ($colname == '^') continue;
-            if (empty($colname)) continue;
-            $cols[$colname] = [
-                'name' => trim(preg_replace('/[^a-zA-Z0-9]+/', '_', $colname)),
-                // A column type is true until a non-valid value is encountered.
-                'date' => TRUE,
-                'datetime' => TRUE,
-                'unsigned_int' => TRUE,
-                'signed_int' => TRUE,
-                'float' => TRUE,
 
-                // Nulls are allowed as soon as an empty cell is found.
-                'empty' => FALSE,
-                'entirelyEmpty' => TRUE,
-                'maxlength' => 0,
-                'maxmblength' => 0,
-                'maxint' => 0,
+        $skipHeaders = [
+            '^',
+            '',
+        ];
 
-                'uniqueVals' => [],
-            ];
-                if (preg_match("/_id$/", $cols[$colname]['name'])) {
-                    $indexCols[] = $cols[$colname]['name'];
+        $ignoreDuplicateHeader = true;
+
+        $type_tests = [
+            'unsigned_int' => '/^\d+$/', 
+            'signed_int' => '/^-?\d+$/', 
+            'float' => '/^\d+\.?\d*$/', 
+            'datetime' => '/^\d\d\d\d-\d\d-\d\d[T ]\d\d:\d\d:\d\d\.?\d*$/',
+            'date' => '/^\d\d\d\d-\d\d-\d\d$/', 
+        ];
+
+        $progressBar = new ProgressBar($output);
+        $progressBar->setMessage("Scanning schema.");
+
+        $nr_cols = 0;
+
+        foreach ($progressBar->iterate($reader) as $offset => $row) {
+            if ($offset == 0) {
+                //Skip Column Names.
+                foreach ($row as $index => $colname) {
+                    $nr_cols++;
+                    if (in_array($colname, $skipHeaders)) continue;
+
+                    //Ignore duplicates.
+                    if ($ignoreDuplicateHeader and in_array($colname, $columns)) continue;
+
+
+                    $columns[$index] = [
+                        'name' => trim(preg_replace('/[^a-zA-Z0-9]+/', '_', $colname)),
+                        'tests' => [
+                            'unsigned_int', 
+                        'signed_int', 
+                        'float', 
+                        'datetime',
+                        'date', 
+                        ],
+                        'type' => 'text',
+                        'maxlength' => 0,
+                        'maxmblength' => 0,
+                        'maxint' => 0,
+                        'empty' => TRUE,
+                    ];
                 }
+                $column_keys = array_keys($columns);
+                continue;
+            }
+
+            if (count($row) != $nr_cols) continue;
+
+            //Figure out type for each column.
+            foreach ($columns as $index => &$column) {
+                //Skip if empty
+                $value = $row[$index];
+                if (is_null($value) or $value == '') continue; 
+
+                $tests = $column['tests'];
+
+                $column['empty'] = FALSE;
+
+                foreach ($tests as $test_type) {
+                    if (preg_match($type_tests[$test_type], $value) == false) {
+                        //If no match.  Then the column is not this type.
+                        $column['tests'] = array_diff($column['tests'], [$test_type]);
+                    } else {
+                        //break;
+                    }
+                }
+                if (in_array($test_type, ['signed_int', 'unsigned_int'])) {
+                    $column['maxint'] = $column['maxint'] < $value ? $value : $column['maxint']; 
+                }
+                $maxlength = strlen($value);
+                $column['maxlength'] = $maxlength > $column['maxlength'] ? $maxlength : $column['maxlength'];
+                $maxmblength = mb_strlen($value);
+                $column['maxmblength'] = $maxmblength > $column['maxmblength'] ? $maxmblength : $column['maxmblength'];
+            }
         }
 
-        // 2x because we scan and then we generate the INSERTS
-        if ($isBigFile) {
-            $progressBar = new ProgressBar($output, count($cols));
-            $progressBar->setFormat('custom');
-            $progressBar->setMessage("Scanning schema.");
-            $progressBar->start();
-        }
+        foreach ($columns as $index => $t) {
 
-        $records = $reader->getRecords();
-
-        foreach (array_keys($cols) as $colname) {
-            $t = &$cols[$colname];
-
-            foreach ($records as $offset => $row) {
-                $val = $row[$colname];
-                $t['uniqueVals'][$val] = 1;
-                if ($val === '') {
-                    // There empty values. (Note here, empty means zero-length string.)
-                    $t['empty'] = TRUE;
-                }
-                else {
-                    $t['entirelyEmpty'] = FALSE;
-                    // We have something other than nothing: rule out certain types if
-                    // the value is not valid for them.
-                    $t['unsigned_int'] &= preg_match('/^\d+$/', (string) $val);
-                    $t['signed_int'] &= preg_match('/^-\d+$/', $val);
-                    $t['float'] &= preg_match('/^-?\d\d*(\.\d+)$/', $val);
-                    $t['date'] &= preg_match('/^\d\d\d\d-\d\d-\d\d$/', $val);
-                    $t['datetime'] &= preg_match('/^\d\d\d\d-\d\d-\d\d[T ]\d\d:\d\d:\d\d$/', $val);
-                }
-
-                // @todo timezones
-                $t['maxmblength'] = max(mb_strlen($val), $t['maxlength']);
-                $t['maxlength'] = max(strlen($val), $t['maxlength']);
-                $t['maxint'] = max(abs((int)($val)), $t['maxint']);
+            if (count($t['tests'])) {
+                $type = array_shift($t['tests']);
+            } else {
+                $type = 'text';
             }
-            $t['unique'] = [];
-            foreach (['date', 'datetime', 'unsigned_int', 'signed_int', 'float'] as $_) {
-                if ($t[$_]) {
-                    $t['unique'][] = $_;
-                }
-            }
-            $c = count($t['unique']);
 
-            // Default data type
-            $type = 'text';
-            if ($t['entirelyEmpty']) {
-                // There is no data. Import as tinyint.
-                $type = 'unsigned_int';
-            }
-            elseif ($c === 1) {
-                // only one match, easy.
-                $type = $t['unique'][0];
-            }
-            elseif ($c > 1) {
-                throw new \RuntimeException("Row " . $offset . " col '" . $colname . "' could be "
-                        . implode(' or ', $t['unique']). " FRom values:\n" . json_encode($t, JSON_PRETTY_PRINT));
+            if (preg_match("/_id$/", $t['name'])) {
+                $indexCols[] = $t['name'];
             }
 
             // Great.
@@ -161,79 +200,77 @@ class ConvertCommand extends Command
                 if ($t['maxlength'] > 65535) {
                     $t['def'] = 'MEDIUMTEXT';
                 }
-                elseif ($t['maxlength'] > 255) {
+                else if ($t['maxlength'] > 255) {
                     $t['def'] = 'TEXT';
                 }
                 else {
                     // allow 10% more than the max chars so far.
                     $t['def'] = 'VARCHAR(' . ((int) (1.10 * $t['maxmblength'])) . ')';
-                            }
-                            // We don't know that we need to differentiate between zero length string and NULL;
-                            // the INSERTS will be zls, so call this column NOT NULL.
-                            $t['def'] .= ' NOT NULL';
-                            }
-                            elseif ($type === 'unsigned_int') {
-                            // @see https://dev.mysql.com/doc/refman/8.0/en/integer-types.html
-                            if ($t['maxint'] <= 255) {
-                            $t['def'] = 'TINYINT UNSIGNED';
-                            }
-                            elseif ($t['maxint'] <= 4294967295) {
-                            $t['def'] = 'INT(10) UNSIGNED';
-                            }
-                            else {
-                            $t['def'] = 'BIGINT UNSIGNED';
-                            }
-                            if (!$t['empty']) {
-                            $t['def'] .= ' NOT NULL DEFAULT 0';
-                            }
-                            }
-                            elseif ($type === 'signed_int') {
-                                // @see https://dev.mysql.com/doc/refman/8.0/en/integer-types.html
-                                if ($t['maxint'] >= -128 && $t['maxint'] <= 127) {
-                                    $t['def'] = 'TINYINT SIGNED';
-                                }
-                                elseif ($t['maxint'] >= -2147483648 && $t['maxint'] <= 2147483647) {
-                                    $t['def'] = 'INT(10) SIGNED';
-                                }
-                                else {
-                                    $t['def'] = 'BIGINT SIGNED';
-                                }
-                                if (!$t['empty']) {
-                                    $t['def'] .= ' NOT NULL DEFAULT 0';
-                                }
-                            }
-                            elseif ($type === 'float') {
-                                $t['def'] = 'DECIMAL(12,4)';
-                                if (!$t['empty']) {
-                                    $t['def'] .= ' NOT NULL DEFAULT 0';
-                                }
-                            }
-                            elseif ($type === 'date') {
-                                $t['def'] = 'DATE';
-                                // All date columns are created with NULL as default
-                                // since setting a default requires a specific date.
-                                // if (!$t['empty']) {
-                                //   $t['def'] .= ' NOT NULL DEFAULT 0';
-                                // }
-                            }
-                            elseif ($type === 'datetime') {
-                                $t['def'] = 'TIMESTAMP';
-                                if (!$t['empty']) {
-                                    $t['def'] .= ' NOT NULL DEFAULT CURRENT_TIMESTAMP';
-                                }
-                            }
+                }
+                // We don't know that we need to differentiate between zero length string and NULL;
+                // the INSERTS will be zls, so call this column NOT NULL.
+                $t['def'] .= ' NOT NULL';
+            }
+            elseif ($type === 'unsigned_int') {
+            // @see https://dev.mysql.com/doc/refman/8.0/en/integer-types.html
+                if ($t['maxint'] <= 255) {
+                    $t['def'] = 'TINYINT UNSIGNED';
+                }
+                else if ($t['maxint'] <= 4294967295) {
+                    $t['def'] = 'INT(10) UNSIGNED';
+                }
+                else {
+                    $t['def'] = 'BIGINT UNSIGNED';
+                }
+
+                if (!$t['empty']) {
+                    $t['def'] .= ' NOT NULL DEFAULT 0';
+                }
+            }
+            elseif ($type === 'signed_int') {
+                // @see https://dev.mysql.com/doc/refman/8.0/en/integer-types.html
+                if ($t['maxint'] >= -128 && $t['maxint'] <= 127) {
+                    $t['def'] = 'TINYINT SIGNED';
+                }
+                elseif ($t['maxint'] >= -2147483648 && $t['maxint'] <= 2147483647) {
+                    $t['def'] = 'INT(10) SIGNED';
+                }
+                else {
+                    $t['def'] = 'BIGINT SIGNED';
+                }
+
+                if (!$t['empty']) {
+                    $t['def'] .= ' NOT NULL DEFAULT 0';
+                }
+            }
+            elseif ($type === 'float') {
+                $t['def'] = 'DECIMAL(12,4)';
+                if (!$t['empty']) {
+                    $t['def'] .= ' NOT NULL DEFAULT 0';
+                }
+            }
+            elseif ($type === 'date') {
+                $t['def'] = 'DATE';
+                // All date columns are created with NULL as default
+                // since setting a default requires a specific date.
+                // if (!$t['empty']) {
+                //   $t['def'] .= ' NOT NULL DEFAULT 0';
+                // }
+            }
+            elseif ($type === 'datetime') {
+                $t['def'] = 'TIMESTAMP';
+                if (!$t['empty']) {
+                    $t['def'] .= ' NOT NULL DEFAULT CURRENT_TIMESTAMP';
+                }
+            }
             else {
                 throw new \RuntimeException("Row " . $offset . " col '" . $colname . "' unexpected type '$type'");
             }
-            $cols[$colname]['type'] = $type;
 
             $schemaCols[$t['name']] = $t['def'];
             if (strtolower($t['name']) === 'id') {
                 $schemaCols[$t['name']] .= ' PRIMARY KEY';
                 $foundID = $t['name'];
-            }
-            if (isset($progressBar)) {
-                $progressBar->advance();
             }
         }
 
@@ -243,7 +280,8 @@ class ConvertCommand extends Command
         }
         $schemaSQL .= "CREATE TABLE IF NOT EXISTS `$tableName` (\n";
         // Add an ID if there is none.
-        $prefix = '';
+        //$prefix = '';
+        $prefix = "  ";
         if (!$foundID) {
             //$schemaSQL .= "  id INT(10) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY";
             //$prefix = ",\n  ";
@@ -255,12 +293,16 @@ class ConvertCommand extends Command
         }
         $schemaSQL .= "\n);\n";
 
-        $indexSQL = "ALTER TABLE '$tableName'\n";
+        $indexSQL = "ALTER TABLE `$tableName`\n";
 
         $index_lines[] = array();
 
         foreach ($indexCols as $colName) {
-            $index_line[] = "\tADD KEY '$colName' ('$colName')";
+            if ($tableName . "_id" == $colName) {
+                $index_line[] = "\tADD PRIMARY KEY `$colName` (`$colName`)";
+            } else {
+                $index_line[] = "\tADD KEY `$colName` (`$colName`)";
+            }
         }
 
         $indexSQL .= implode(",\n", $index_line) . ";\n";
@@ -268,6 +310,8 @@ class ConvertCommand extends Command
 
         $output->writeln("<info>$schemaSQL</info>");
         $output->writeln("<info>$indexSQL</info>");
+        $this->filesystem->appendToFile($this->outputFile, $schemaSQL);
+        $this->filesystem->appendToFile($this->outputFile, $indexSQL);
 
         if (isset($progressBar)) {
             $progressBar->finish();
