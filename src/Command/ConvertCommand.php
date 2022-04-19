@@ -10,8 +10,9 @@
  */
 namespace App\Command;
 
+use SplFileObject;
+
 use League\Csv\Reader;
-use League\Csv\Stream;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -23,50 +24,33 @@ use Symfony\Component\Filesystem\Filesystem;
 
 class ConvertCommand extends Command
 {
-    public static $maxint = 0;
-
     protected $outputFile;
-    protected $filesystem;
+
     protected function configure() {
         $this->setName('convert')
             ->setDescription('Convert CSV file to MySQL SQL')
             ->setHelp('')
-            // ->addOption('output', 'o', InputOption::VALUE_REQUIRED, 'output SQL filename')
+            ->addOption('output', 'o', InputOption::VALUE_REQUIRED, 'output SQL filename','php://stdout')
             ->addOption('drop', 'd', InputOption::VALUE_NONE, 'Include DROP TABLE? (default no, and use CREATE TABLE IF NOT EXISTS)')
             ->addOption('schema', 's', InputOption::VALUE_NONE, 'Just the schema, no INSERTs')
-            ->addOption('import-extension', 'e', InputOption::VALUE_REQUIRED, 'Extension of files to import (i.e. csv or dat)','dat')
+            ->addOption('csv-separator', null, InputOption::VALUE_REQUIRED, 'The optional separator parameter sets the field separator (one single-byte character only)',',')
+            ->addOption('csv-enclosure', null, InputOption::VALUE_REQUIRED, 'The optional enclosure parameter sets the field enclosure character (one single-byte character only)','"')
+            ->addOption('csv-escape', null, InputOption::VALUE_REQUIRED, 'The optional escape parameter sets the escape character (at most one single-byte character)','\\')
             ->addOption('csv-read-buffer', 'b', InputOption::VALUE_REQUIRED, 'Buffer size in kB. Each line of CSV must be shorter than this. Default 10', 10)
             ->addOption('max-command-length', 'm', InputOption::VALUE_REQUIRED, 'Max length of INSERT SQL command in kB. Default 10.', 10)
-            ->addArgument('inputfiles', InputArgument::IS_ARRAY | InputArgument::REQUIRED, "CSV files or Directory of files to convert")
+            ->addArgument('inputfiles', InputArgument::IS_ARRAY | InputArgument::REQUIRED, "CSV files to convert")
             ;
     }
 
     protected function execute(InputInterface $input, OutputInterface $output) {
 
-        $inputfiles = $input->getArgument('inputfiles');
+        $this->outputFile = new SplFileObject($input->getOption('output'), 'w');
 
-        $extension = $input->getOption('import-extension');
-
-        $files = array();
-        $this->filesystem = new Filesystem();
-        $this->outputFile = "output.sql";
-        //$this->filesystem->remove($this->outputFile);
-
-        foreach ($inputfiles as $inputfile) {
+        foreach ($input->getArgument('inputfiles') as $file) {
             // Open a known directory, and proceed to read its contents
-            if (is_dir($inputfile)) {
-                $dirfiles = glob($inputfile . "/*." . $extension);
-                if ($dirfiles) {
-                    $files += $dirfiles;
-                }
-            } else {
-                $files[] = $inputfile;
-            }
-        }
-
-        foreach ($files as $file) {
             $this->executeOne($input, $output, $file);
         }
+
         return 0;
     }
 
@@ -83,15 +67,14 @@ class ConvertCommand extends Command
         }
         try {
             $reader = Reader::createFromPath($csvFilename, 'r');
-            $reader->setDelimiter('|');
+            $reader->setDelimiter($input->getOption('csv-separator'));
+            $reader->setEnclosure($input->getOption('csv-enclosure'));
+            $reader->setEscape($input->getOption('csv-escape'));
         }
         catch (\Exception $e) {
             $output->writeln("<error>-- Error: input '$csvFilename': " . $e->getMessage() . "</error>");
             return 1;
         }
-
-        //$isBigFile = ($reader->count() > 100);
-
 
         $path_parts = pathinfo($csvFilename);
 
@@ -308,10 +291,11 @@ class ConvertCommand extends Command
         $indexSQL .= implode(",\n", $index_line) . ";\n";
 
 
-        $output->writeln("<info>$schemaSQL</info>");
-        $output->writeln("<info>$indexSQL</info>");
-        $this->filesystem->appendToFile($this->outputFile, $schemaSQL);
-        $this->filesystem->appendToFile($this->outputFile, $indexSQL);
+        //$output->writeln("<info>$schemaSQL</info>");
+        //$output->writeln("<info>$indexSQL</info>");
+        $this->outputFile->fwrite($schemaSQL);
+        //$this->filesystem->appendToFile($this->outputFile, $schemaSQL);
+        //$this->filesystem->appendToFile($this->outputFile, $indexSQL);
 
         if (isset($progressBar)) {
             $progressBar->finish();
